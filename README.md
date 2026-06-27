@@ -1,7 +1,7 @@
 # qmark
 
 `qmark` is a small non-TUI terminal helper for quick command-line syntax questions.
-It sends a short prompt plus lightweight shell context to a local Ollama model, then
+It sends a short prompt plus lightweight shell context to a chat model, then
 prints a terse answer, a primary command, alternatives, requirements, notes, and risk.
 
 ```sh
@@ -71,6 +71,52 @@ Pick a model with `QMARK_MODEL`:
 QMARK_MODEL=qwen3-coder:30b qmark "rsync this folder with progress"
 QMARK_MODEL=qwen3:14b qmark "tar gzip syntax"
 ```
+
+## OpenRouter Or Other Remote APIs
+
+`qmark` can also use OpenAI-compatible chat completion APIs. For OpenRouter:
+
+```sh
+export OPENROUTER_API_KEY=sk-or-...
+qmark --provider openrouter \
+  "rsync this folder with progress"
+```
+
+Remote providers default to `z-ai/glm-5.2`. Pass `--model` or set
+`QMARK_MODEL` to use a different model.
+
+To make that the default:
+
+```sh
+export QMARK_PROVIDER=openrouter
+export QMARK_BASE_URL=https://openrouter.ai/api/v1
+export OPENROUTER_API_KEY=sk-or-...
+```
+
+Then run:
+
+```sh
+qmark "tar gzip syntax"
+```
+
+All remote configuration can use `QMARK_*` variables:
+
+```sh
+export QMARK_MODE=openrouter
+export QMARK_BASE_URL=https://openrouter.ai/api/v1
+export QMARK_NAMESPACE=z-ai
+export QMARK_MODEL=glm-5.2
+export QMARK_API_KEY=sk-or-...
+```
+
+`QMARK_PROVIDER` and `QMARK_MODE` both select the provider. `QMARK_PROVIDER`
+takes precedence when both are set. `QMARK_NAMESPACE` is prepended only when
+the model does not already contain a `/`, so `QMARK_MODEL=z-ai/glm-5.2` works
+too.
+
+For other OpenAI-compatible APIs, set `QMARK_BASE_URL` to the API base URL
+that contains `/chat/completions` under it, and set either `QMARK_API_KEY` or
+`OPENAI_API_KEY`.
 
 ## Private Tool Syntax
 

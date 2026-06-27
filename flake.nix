@@ -1,5 +1,5 @@
 {
-  description = "qmark: a local terminal question helper backed by Ollama";
+  description = "qmark: a terminal question helper backed by Ollama or a remote chat API";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -36,7 +36,7 @@
             '';
 
             meta = {
-              description = "A local terminal question helper backed by Ollama";
+              description = "A terminal question helper backed by Ollama or a remote chat API";
               homepage = "https://github.com/bwilson/qmark";
               license = pkgs.lib.licenses.mit;
               mainProgram = "qmark";

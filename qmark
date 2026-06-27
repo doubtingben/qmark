@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-qmark: a tiny local terminal question helper backed by Ollama.
+qmark: a tiny terminal question helper backed by Ollama or a remote chat API.
 
 Example:
   qmark "find files larger than 500mb under this directory"
@@ -25,8 +25,16 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL = os.environ.get("QMARK_MODEL", "qwen2.5-coder:latest")
-DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_PROVIDER = os.environ.get("QMARK_PROVIDER", os.environ.get("QMARK_MODE", "ollama"))
+DEFAULT_MODEL = os.environ.get("QMARK_MODEL")
+DEFAULT_NAMESPACE = os.environ.get("QMARK_NAMESPACE")
+DEFAULT_OLLAMA_MODEL = os.environ.get("QMARK_OLLAMA_MODEL", "qwen2.5-coder:latest")
+DEFAULT_REMOTE_MODEL = os.environ.get("QMARK_REMOTE_MODEL", "z-ai/glm-5.2")
+DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_OPENAI_BASE_URL = os.environ.get(
+    "QMARK_BASE_URL",
+    os.environ.get("OPENAI_BASE_URL", "https://openrouter.ai/api/v1"),
+)
 DEFAULT_HOME = Path(os.environ.get("QMARK_HOME", "~/.local/share/qmark")).expanduser()
 VERSION = "0.1.0"
 MAX_KNOWLEDGE_CHARS = 7000
@@ -68,11 +76,31 @@ SECRET_PATTERNS = [
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="qmark",
-        description="Ask a quick terminal syntax question using a local Ollama model.",
+        description="Ask a quick terminal syntax question using Ollama or an OpenAI-compatible API.",
     )
     parser.add_argument("prompt", nargs="*", help="Short natural-language question.")
-    parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"Ollama model. Default: {DEFAULT_MODEL}")
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Ollama host. Default: {DEFAULT_HOST}")
+    parser.add_argument(
+        "--provider",
+        choices=["ollama", "openai", "openai-compatible", "openrouter", "remote"],
+        default=DEFAULT_PROVIDER,
+        help=f"Model provider. Default: {DEFAULT_PROVIDER}",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_MODEL,
+        help=(
+            "Model name. Defaults to QMARK_MODEL if set, otherwise "
+            f"{DEFAULT_OLLAMA_MODEL} for Ollama or {DEFAULT_REMOTE_MODEL} for remote providers."
+        ),
+    )
+    parser.add_argument("--host", help="Ollama host or OpenAI-compatible base URL. Defaults depend on --provider.")
+    parser.add_argument("--api-key", default=os.environ.get("QMARK_API_KEY"), help="API key for remote providers.")
+    parser.add_argument(
+        "--namespace",
+        default=DEFAULT_NAMESPACE,
+        help="Model namespace for remote providers, for example z-ai. Default: QMARK_NAMESPACE.",
+    )
     parser.add_argument("--cmd", action="store_true", help="Print only the primary command.")
     parser.add_argument("--copy", action="store_true", help="Copy the primary command to the clipboard with pbcopy.")
     parser.add_argument("--json", action="store_true", help="Print the parsed JSON response.")
@@ -87,6 +115,16 @@ def main() -> int:
     parser.add_argument("--knowledge-dir", default=str(DEFAULT_HOME / "knowledge"), help="Directory for saved local knowledge.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
+    try:
+        provider = normalize_provider(args.provider)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if provider == "ollama":
+        host = args.host or DEFAULT_OLLAMA_HOST
+        model = args.model or DEFAULT_OLLAMA_MODEL
+    else:
+        host = args.host or DEFAULT_OPENAI_BASE_URL
+        model = resolve_remote_model(args.model or DEFAULT_REMOTE_MODEL, args.namespace)
 
     knowledge_dir = Path(args.knowledge_dir).expanduser()
     if args.list_knowledge:
@@ -114,7 +152,7 @@ def main() -> int:
         print(context)
         return 0
     try:
-        result = ask_ollama(args.host, args.model, question, context)
+        result = ask_model(provider, host, model, args.api_key, question, context)
     except RuntimeError as exc:
         print(f"qmark: {exc}", file=sys.stderr)
         return 1
@@ -136,23 +174,62 @@ def main() -> int:
     return 0
 
 
-def api_url(host: str) -> str:
+def ollama_api_url(host: str) -> str:
     host = host.rstrip("/")
     if host.endswith("/api"):
         return f"{host}/chat"
     return f"{host}/api/chat"
 
 
-def ask_ollama(host: str, model: str, question: str, context: str) -> dict[str, Any]:
+def chat_completions_url(base_url: str) -> str:
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return f"{base_url}/chat/completions"
+
+
+def ask_model(provider: str, host: str, model: str, api_key: str | None, question: str, context: str) -> dict[str, Any]:
+    system, user = build_messages(question, context)
+    if provider == "ollama":
+        return ask_ollama(host, model, system, user)
+    if provider == "openai":
+        return ask_openai_compatible(host, model, api_key, system, user)
+    raise RuntimeError(f"unknown provider: {provider}")
+
+
+def normalize_provider(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized == "ollama":
+        return "ollama"
+    if normalized in {"openai", "openai-compatible", "openrouter", "remote"}:
+        return "openai"
+    raise ValueError(f"unknown provider: {value}")
+
+
+def resolve_remote_model(model: str, namespace: str | None) -> str:
+    namespace = (namespace or "").strip().strip("/")
+    model = model.strip()
+    if namespace and "/" not in model:
+        return f"{namespace}/{model}"
+    return model
+
+
+def build_messages(question: str, context: str) -> tuple[str, str]:
     system = (
         "You are a terse terminal syntax assistant. The user is in a shell session and "
         "typed a short prompt after a question-mark helper command. Return only JSON "
-        "matching the schema. Give one best command when possible. Keep explanations "
-        "short. Prefer safe, inspectable commands. If a command may change files, use "
-        "dry-run/listing flags when available and mark risk medium or high."
+        "with this shape: answer string, command string, alternatives string array, "
+        "requires string array, risk one of low/medium/high, notes string array. Give "
+        "one best command when possible. Keep explanations short. Prefer safe, "
+        "inspectable commands. If a command may change files, use dry-run/listing "
+        "flags when available and mark risk medium or high."
     )
     user = f"Question:\n{question}\n\nContext:\n{context or '(context disabled)'}"
-    payload = {
+    return system, user
+
+
+def ask_ollama(host: str, model: str, system: str, user: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
@@ -164,7 +241,7 @@ def ask_ollama(host: str, model: str, question: str, context: str) -> dict[str, 
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        api_url(host),
+        ollama_api_url(host),
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -180,12 +257,106 @@ def ask_ollama(host: str, model: str, question: str, context: str) -> dict[str, 
     except TimeoutError as exc:
         raise RuntimeError("Ollama request timed out.") from exc
 
-    content = raw.get("message", {}).get("content", "")
+    content = raw.get("message", {}).get("content", "") or ""
+    parsed = parse_model_json(content)
+    return normalize_result(parsed)
+
+
+def ask_openai_compatible(
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    system: str,
+    user: str,
+) -> dict[str, Any]:
+    api_key = api_key or infer_api_key(base_url)
+    if not api_key:
+        raise RuntimeError(
+            "missing API key for remote provider. Set QMARK_API_KEY, OPENROUTER_API_KEY, "
+            "or OPENAI_API_KEY, or pass --api-key."
+        )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    referer = os.environ.get("QMARK_HTTP_REFERER")
+    app_title = os.environ.get("QMARK_APP_TITLE", "qmark")
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if app_title:
+        headers["X-Title"] = app_title
+
+    raw = post_chat_completions(base_url, headers, payload)
+
+    content = raw.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+    parsed = parse_model_json(content)
+    return normalize_result(parsed)
+
+
+def parse_model_json(content: str) -> dict[str, Any]:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"model returned invalid JSON: {content[:300]!r}") from exc
-    return normalize_result(parsed)
+        fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", content, flags=re.DOTALL | re.IGNORECASE)
+        if fenced:
+            try:
+                parsed = json.loads(fenced.group(1))
+            except json.JSONDecodeError:
+                raise RuntimeError(f"model returned invalid JSON: {content[:300]!r}") from exc
+        else:
+            raise RuntimeError(f"model returned invalid JSON: {content[:300]!r}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"model returned JSON that is not an object: {content[:300]!r}")
+    return parsed
+
+
+def post_chat_completions(base_url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+    url = chat_completions_url(base_url)
+    try:
+        return post_json(url, headers, payload)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        if exc.code == 400 and "response_format" in detail and "response_format" in payload:
+            retry_payload = dict(payload)
+            retry_payload.pop("response_format")
+            try:
+                return post_json(url, headers, retry_payload)
+            except urllib.error.HTTPError as retry_exc:
+                retry_detail = retry_exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(
+                    f"remote API request failed with HTTP {retry_exc.code}: {retry_detail}"
+                ) from retry_exc
+            except urllib.error.URLError as retry_exc:
+                raise RuntimeError(f"could not reach remote API at {base_url}.") from retry_exc
+            except TimeoutError as retry_exc:
+                raise RuntimeError("remote API request timed out.") from retry_exc
+        raise RuntimeError(f"remote API request failed with HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not reach remote API at {base_url}.") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("remote API request timed out.") from exc
+
+
+def post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def infer_api_key(base_url: str) -> str | None:
+    if "openrouter.ai" in base_url:
+        return os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    return os.environ.get("OPENAI_API_KEY")
 
 
 def normalize_result(value: dict[str, Any]) -> dict[str, Any]:
