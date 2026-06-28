@@ -162,6 +162,8 @@ qmark --list-knowledge
 
 `--run` asks before executing. Commands that look high-risk require `--unsafe` as well.
 History is opt-in because shell history can contain secrets.
+Interactive runs show a stderr status line while waiting for the model, including
+elapsed time. Use `--no-status` or set `QMARK_NO_STATUS=1` to disable it.
 
 ## Development
 

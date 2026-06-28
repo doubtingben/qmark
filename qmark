@@ -11,6 +11,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import platform
@@ -18,7 +19,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import textwrap
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -106,6 +109,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Print the parsed JSON response.")
     parser.add_argument("--run", action="store_true", help="Ask for confirmation, then run the primary command.")
     parser.add_argument("--unsafe", action="store_true", help="Allow --run for high-risk commands after confirmation.")
+    parser.add_argument("--no-status", action="store_true", help="Do not show an interactive model wait indicator.")
     parser.add_argument("--no-context", action="store_true", help="Do not include cwd/git/file context.")
     parser.add_argument("--history-lines", type=int, default=0, help="Opt-in: include this many recent shell history lines.")
     parser.add_argument("--learn", metavar="NAME", help="Read help/docs from stdin and save them as local knowledge.")
@@ -152,7 +156,15 @@ def main() -> int:
         print(context)
         return 0
     try:
-        result = ask_model(provider, host, model, args.api_key, question, context)
+        result = ask_model_with_status(
+            provider,
+            host,
+            model,
+            args.api_key,
+            question,
+            context,
+            enabled=not args.no_status,
+        )
     except RuntimeError as exc:
         print(f"qmark: {exc}", file=sys.stderr)
         return 1
@@ -195,6 +207,87 @@ def ask_model(provider: str, host: str, model: str, api_key: str | None, questio
     if provider == "openai":
         return ask_openai_compatible(host, model, api_key, system, user)
     raise RuntimeError(f"unknown provider: {provider}")
+
+
+def ask_model_with_status(
+    provider: str,
+    host: str,
+    model: str,
+    api_key: str | None,
+    question: str,
+    context: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    if not should_show_status(enabled):
+        return ask_model(provider, host, model, api_key, question, context)
+
+    status = QueryStatus(provider, model)
+    status.start()
+    try:
+        result = ask_model(provider, host, model, api_key, question, context)
+    except BaseException:
+        status.stop(success=False)
+        raise
+    finally:
+        if not status.done.is_set():
+            status.stop(success=True)
+    return result
+
+
+def should_show_status(enabled: bool) -> bool:
+    if not enabled:
+        return False
+    if os.environ.get("QMARK_NO_STATUS"):
+        return False
+    return sys.stderr.isatty()
+
+
+def format_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(int(seconds), 60)
+    return f"{minutes}m {remainder:02d}s"
+
+
+def terminal_line_width() -> int:
+    return max(20, shutil.get_terminal_size((100, 20)).columns - 1)
+
+
+class QueryStatus:
+    def __init__(self, provider: str, model: str) -> None:
+        self.provider = provider
+        self.model = model
+        self.started = time.monotonic()
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self, success: bool) -> None:
+        self.done.set()
+        self.thread.join(timeout=0.5)
+        elapsed = time.monotonic() - self.started
+        verb = "response received" if success else "request failed"
+        self._write_line(f"qmark: {verb} in {format_elapsed(elapsed)}", newline=True)
+
+    def _run(self) -> None:
+        for frame in itertools.cycle("|/-\\"):
+            elapsed = time.monotonic() - self.started
+            message = (
+                f"qmark: waiting for {self.provider}/{self.model} "
+                f"{frame} {format_elapsed(elapsed)}"
+            )
+            self._write_line(message, newline=False)
+            if self.done.wait(0.1):
+                return
+
+    def _write_line(self, message: str, newline: bool) -> None:
+        width = terminal_line_width()
+        sys.stderr.write("\r" + message[:width].ljust(width))
+        if newline:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def normalize_provider(value: str) -> str:
