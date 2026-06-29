@@ -41,6 +41,72 @@ DEFAULT_OPENAI_BASE_URL = os.environ.get(
 DEFAULT_HOME = Path(os.environ.get("QMARK_HOME", "~/.local/share/qmark")).expanduser()
 VERSION = "0.1.0"
 MAX_KNOWLEDGE_CHARS = 7000
+MAX_REPO_CONTEXT_CHARS = 12000
+MAX_REPO_FILE_EXCERPT_CHARS = 2200
+MAX_REPO_CONTEXT_FILES = 12
+MAX_REPO_FILE_SAMPLE = 80
+
+PROJECT_FILE_NAMES = {
+    ".envrc",
+    ".nvmrc",
+    ".python-version",
+    ".ruby-version",
+    ".tool-versions",
+    "AGENTS.md",
+    "Cargo.toml",
+    "Dockerfile",
+    "Gemfile",
+    "GNUmakefile",
+    "Justfile",
+    "Makefile",
+    "Pipfile",
+    "Procfile",
+    "README",
+    "README.md",
+    "README.rst",
+    "Taskfile.yml",
+    "Taskfile.yaml",
+    "bun.lockb",
+    "compose.yaml",
+    "compose.yml",
+    "deno.json",
+    "devenv.nix",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+    "flake.nix",
+    "go.mod",
+    "mise.toml",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "poetry.lock",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "requirements.txt",
+    "setup.cfg",
+    "setup.py",
+    "shell.nix",
+    "tox.ini",
+    "uv.lock",
+    "yarn.lock",
+}
+
+PROJECT_FILE_SUFFIXES = (
+    ".csproj",
+    ".fsproj",
+    ".sln",
+)
+
+LOCK_FILE_NAMES = {
+    "bun.lockb",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "yarn.lock",
+}
+PROJECT_FILE_NAME_KEYS = {name.lower() for name in PROJECT_FILE_NAMES}
+LOCK_FILE_NAME_KEYS = {name.lower() for name in LOCK_FILE_NAMES}
 
 SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -50,9 +116,10 @@ SCHEMA: dict[str, Any] = {
         "alternatives": {"type": "array", "items": {"type": "string"}},
         "requires": {"type": "array", "items": {"type": "string"}},
         "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         "notes": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["answer", "command", "alternatives", "requires", "risk", "notes"],
+    "required": ["answer", "command", "alternatives", "requires", "risk", "confidence", "notes"],
 }
 
 RISKY_PATTERNS = [
@@ -107,6 +174,12 @@ def main() -> int:
     parser.add_argument("--cmd", action="store_true", help="Print only the primary command.")
     parser.add_argument("--copy", action="store_true", help="Copy the primary command to the clipboard with pbcopy.")
     parser.add_argument("--json", action="store_true", help="Print the parsed JSON response.")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print explanation, alternatives, requirements, notes, risk, and confidence.",
+    )
     parser.add_argument("--run", action="store_true", help="Ask for confirmation, then run the primary command.")
     parser.add_argument("--unsafe", action="store_true", help="Allow --run for high-risk commands after confirmation.")
     parser.add_argument("--no-status", action="store_true", help="Do not show an interactive model wait indicator.")
@@ -148,7 +221,7 @@ def main() -> int:
         parser.print_help(sys.stderr)
         return 2
 
-    context = "" if args.no_context else build_context(args.history_lines)
+    context = "" if args.no_context else build_context(args.history_lines, question)
     knowledge = retrieve_knowledge(knowledge_dir, question)
     if knowledge:
         context = f"{context}\n\nlocal_knowledge:\n{knowledge}" if context else f"local_knowledge:\n{knowledge}"
@@ -174,6 +247,8 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     elif args.cmd:
+        print(result.get("command", "").strip())
+    elif not args.verbose and should_print_command_only(result):
         print(result.get("command", "").strip())
     else:
         print_human(result)
@@ -312,10 +387,12 @@ def build_messages(question: str, context: str) -> tuple[str, str]:
         "You are a terse terminal syntax assistant. The user is in a shell session and "
         "typed a short prompt after a question-mark helper command. Return only JSON "
         "with this shape: answer string, command string, alternatives string array, "
-        "requires string array, risk one of low/medium/high, notes string array. Give "
-        "one best command when possible. Keep explanations short. Prefer safe, "
-        "inspectable commands. If a command may change files, use dry-run/listing "
-        "flags when available and mark risk medium or high."
+        "requires string array, risk one of low/medium/high, confidence one of "
+        "low/medium/high, notes string array. Use confidence high only when the "
+        "command syntax directly matches the request and context. Give one best "
+        "command when possible. Keep explanations short. Prefer safe, inspectable "
+        "commands. If a command may change files, use dry-run/listing flags when "
+        "available and mark risk medium or high."
     )
     user = f"Question:\n{question}\n\nContext:\n{context or '(context disabled)'}"
     return system, user
@@ -459,8 +536,16 @@ def normalize_result(value: dict[str, Any]) -> dict[str, Any]:
         "alternatives": list_of_strings(value.get("alternatives", []))[:3],
         "requires": list_of_strings(value.get("requires", []))[:5],
         "risk": str(value.get("risk", "low")).strip().lower(),
+        "confidence": normalize_confidence(value.get("confidence", "medium")),
         "notes": list_of_strings(value.get("notes", []))[:5],
     }
+
+
+def normalize_confidence(value: Any) -> str:
+    confidence = str(value).strip().lower()
+    if confidence in {"low", "medium", "high"}:
+        return confidence
+    return "medium"
 
 
 def list_of_strings(value: Any) -> list[str]:
@@ -469,13 +554,16 @@ def list_of_strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def build_context(history_lines: int) -> str:
+def build_context(history_lines: int, question: str = "") -> str:
     lines = [
         f"os: {platform.platform()}",
         f"shell: {os.environ.get('SHELL', 'unknown')}",
         f"cwd: {Path.cwd()}",
     ]
-    lines.extend(git_context())
+    root = git_root()
+    lines.extend(git_context(root))
+    if root:
+        lines.extend(repo_context(root, question))
     lines.extend(file_context())
     if history_lines > 0:
         lines.extend(history_context(history_lines))
@@ -606,20 +694,152 @@ def safe_name(name: str) -> str:
     return cleaned or "knowledge"
 
 
-def git_context() -> list[str]:
+def git_root() -> Path | None:
     if not shutil.which("git"):
+        return None
+    root = run_capture(["git", "rev-parse", "--show-toplevel"])
+    if not root:
+        return None
+    return Path(root)
+
+
+def git_context(root: Path | None) -> list[str]:
+    if not root:
         return []
-    branch = run_capture(["git", "branch", "--show-current"])
-    status = run_capture(["git", "status", "--short"])
-    if branch is None and status is None:
-        return []
-    lines = []
+    branch = run_capture(["git", "-C", str(root), "branch", "--show-current"])
+    status = run_capture(["git", "-C", str(root), "status", "--short"])
+    lines = [f"git_root: {root}"]
+    relative_cwd = relative_to(Path.cwd(), root)
+    if relative_cwd and relative_cwd != ".":
+        lines.append(f"git_relative_cwd: {relative_cwd}")
     if branch:
         lines.append(f"git_branch: {branch}")
     if status:
         lines.append("git_status:")
         lines.extend(f"  {line}" for line in status.splitlines()[:20])
     return lines
+
+
+def repo_context(root: Path, question: str) -> list[str]:
+    tracked = tracked_files(root)
+    if not tracked:
+        return []
+
+    lines = [
+        f"repo_tracked_files: {len(tracked)}",
+    ]
+    top_level = top_level_entries(tracked)
+    if top_level:
+        lines.append("repo_top_level: " + ", ".join(top_level[:40]))
+    file_types = file_type_summary(tracked)
+    if file_types:
+        lines.append("repo_file_types: " + ", ".join(file_types))
+
+    sample = file_sample(tracked, question)
+    if sample:
+        lines.append("repo_files_sample:")
+        lines.extend(f"  {path}" for path in sample[:MAX_REPO_FILE_SAMPLE])
+
+    selected = select_repo_context_files(tracked, question)
+    if not selected:
+        return lines
+
+    lines.append("repo_context_files:")
+    used = len("\n".join(lines))
+    for rel_path in selected:
+        entry = repo_file_excerpt(root, rel_path)
+        if not entry:
+            continue
+        if used + len(entry) + 1 > MAX_REPO_CONTEXT_CHARS:
+            break
+        lines.extend(entry.splitlines())
+        used += len(entry) + 1
+    return lines
+
+
+def tracked_files(root: Path) -> list[str]:
+    output = run_capture(["git", "-C", str(root), "ls-files"])
+    if not output:
+        return []
+    return [line for line in output.splitlines() if line]
+
+
+def relative_to(path: Path, root: Path) -> str | None:
+    try:
+        return str(path.resolve().relative_to(root.resolve())) or "."
+    except (OSError, ValueError):
+        return None
+
+
+def top_level_entries(paths: list[str]) -> list[str]:
+    entries = {path.split("/", 1)[0] + ("/" if "/" in path else "") for path in paths}
+    return sorted(entries, key=lambda value: value.lower())
+
+
+def file_type_summary(paths: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    for path in paths:
+        suffix = Path(path).suffix.lower()
+        label = suffix if suffix else "[no extension]"
+        counts[label] = counts.get(label, 0) + 1
+    return [
+        f"{label}:{count}"
+        for label, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+    ]
+
+
+def file_sample(paths: list[str], question: str) -> list[str]:
+    query = tokens(question)
+    return sorted(paths, key=lambda path: file_priority(path, query))[:MAX_REPO_FILE_SAMPLE]
+
+
+def select_repo_context_files(paths: list[str], question: str) -> list[str]:
+    query = tokens(question)
+    scored = [(file_priority(path, query), path) for path in paths]
+    selected = [path for (score, _), path in sorted(scored) if score < 1000]
+    return selected[:MAX_REPO_CONTEXT_FILES]
+
+
+def file_priority(path: str, query: set[str]) -> tuple[int, str]:
+    path_obj = Path(path)
+    name = path_obj.name
+    name_lower = name.lower()
+    path_lower = path.lower()
+    score = 1000
+
+    if name_lower in PROJECT_FILE_NAME_KEYS or any(
+        name_lower.endswith(suffix) for suffix in PROJECT_FILE_SUFFIXES
+    ):
+        score = min(score, 10)
+    if name_lower.startswith("readme"):
+        score = min(score, 15)
+    if query and any(token in path_lower for token in query):
+        score = min(score, 20)
+    score += path.count("/") * 5
+    return (score, path_lower)
+
+
+def repo_file_excerpt(root: Path, rel_path: str) -> str:
+    path = root / rel_path
+    if Path(rel_path).name.lower() in LOCK_FILE_NAME_KEYS:
+        return f"  [{rel_path}]\n    present; lockfile contents omitted"
+    try:
+        if not path.is_file():
+            return ""
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    if b"\0" in raw:
+        return f"  [{rel_path}]\n    binary file omitted"
+
+    text = redact(raw.decode("utf-8", errors="ignore")).strip()
+    if not text:
+        return ""
+    if len(text) > MAX_REPO_FILE_EXCERPT_CHARS:
+        text = text[:MAX_REPO_FILE_EXCERPT_CHARS].rsplit("\n", 1)[0].rstrip()
+        text = f"{text}\n    ... truncated"
+    indented = "\n".join(f"    {line}" if line else "" for line in text.splitlines())
+    return f"  [{rel_path}]\n{indented}"
 
 
 def file_context() -> list[str]:
@@ -679,6 +899,14 @@ def is_risky(command: str) -> bool:
     return any(re.search(pattern, command) for pattern in RISKY_PATTERNS)
 
 
+def should_print_command_only(result: dict[str, Any]) -> bool:
+    return (
+        bool(result.get("command", "").strip())
+        and result.get("confidence") == "high"
+        and result.get("risk") != "high"
+    )
+
+
 def print_human(result: dict[str, Any]) -> None:
     answer = result.get("answer", "")
     command = result.get("command", "")
@@ -699,6 +927,7 @@ def print_human(result: dict[str, Any]) -> None:
         for item in result["notes"]:
             print(f"  - {item}")
     print(f"\nRisk: {result.get('risk', 'low')}")
+    print(f"Confidence: {result.get('confidence', 'medium')}")
 
 
 def copy_to_clipboard(command: str) -> None:

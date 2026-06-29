@@ -1,8 +1,9 @@
 # qmark
 
 `qmark` is a small non-TUI terminal helper for quick command-line syntax questions.
-It sends a short prompt plus lightweight shell context to a chat model, then
-prints a terse answer, a primary command, alternatives, requirements, notes, and risk.
+It sends a short prompt plus lightweight shell and repository context to a chat
+model, then prints a terse answer, a primary command, alternatives, requirements,
+notes, and risk.
 
 ```sh
 qmark "find files larger than 500mb below here"
@@ -148,10 +149,17 @@ would be sent to the model:
 qmark --show-context "how do I deploy staging?"
 ```
 
+By default, context includes the current OS, shell, cwd, current directory
+entries, and, when run inside a git worktree, the git root, branch, dirty status,
+tracked-file summary, and capped excerpts from project files such as README,
+flake, package, Makefile, pyproject, go.mod, Cargo, Docker, and task-runner
+configuration files. Use `--no-context` to disable this.
+
 ## Useful Options
 
 ```sh
-qmark --cmd "git command to list files changed in HEAD"
+qmark "git command to list files changed in HEAD"
+qmark --verbose "git command to list files changed in HEAD"
 qmark --copy "rsync this folder to my server but show progress"
 qmark --run "count lines of python in this repo"
 qmark --json "git command to list branches by most recent commit"
@@ -159,6 +167,11 @@ qmark --no-context "tar syntax for gzip archive"
 qmark --history-lines 5 "turn my last command into a loop"
 qmark --list-knowledge
 ```
+
+By default, `qmark` prints only the command when the model has high confidence
+and the command is not high-risk. Use `--verbose` or `-v` to print the full
+answer, alternatives, requirements, notes, risk, and confidence. `--cmd` always
+prints only the primary command.
 
 `--run` asks before executing. Commands that look high-risk require `--unsafe` as well.
 History is opt-in because shell history can contain secrets.
